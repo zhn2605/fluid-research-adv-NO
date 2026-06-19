@@ -68,7 +68,7 @@ def build_library(u, v, dx=1.0, dy=1.0):
         ("v*v_y", v * v_y),
     ]
 
-    names = [n for (n,) in pairs]
+    names = [n for n, _ in pairs]
     Phi = torch.stack([t for _, t in pairs], dim=2)
 
     return Phi, names
@@ -77,6 +77,7 @@ def build_library(u, v, dx=1.0, dy=1.0):
 def sparse_regression(Phi, b, threshold=0.05, max_iter=10, alpha=1e-5):
     # b in this case represents target column, i.e. time derivative
     # alpha represents regularization strength for numerical stability
+    # note this isnt the entire sparse_regression, but idrk what else to call this function
     if b.dim() == 1:
         b = b.unsqueeze(-1)
         N, M = Phi.shape
@@ -122,11 +123,49 @@ class PDEDiscovery(nn.Module):
         self.dt = dt
         self.threshold = threshold  # beta
         self.max_iter = max_iter  # k
+
+        assert downsample >= 1
         self.downsample = int(downsample)
 
     def forward(self, seq):
-        # takes in sequence of tensors, uses
-        return
+        # takes in sequence of tensors, builds library and runs algorithm for discoverying PDE
+        s = self.downsample
+
+        seq_ds = seq[..., ::s, ::s]  # stride downsample
+        u_full = seq_ds[:, :, 0]
+        v_full = seq_ds[:, :, 1]
+
+        du_dt = (u_full[:, 2:] - u_full[:, :-2]) / (2.0 * self.dt)
+        dv_dt = (v_full[:, 2:] - v_full[:, :-2]) / (2.0 * self.dt)
+
+        u_mid = u_full[:, 1:-1]
+        v_mid = v_full[:, 1:-1]
+        Phi, _ = build_library(u_mid, v_mid, dx=self.dx * s, dy=self.dy * s)
+        B, Tm, nT, h, w = Phi.shape
+
+        # flatten Phi and values for sparse_regression compute compataility
+        Phi_flat = Phi.permute(0, 1, 3, 4, 2)  # 22 features (lirary terms) are sorted last
+        du_dt_flat = du_dt.reshape(-1, 1)
+        dv_dt_flat = dv_dt.reshape(-1, 1)
+
+        # Full Sparse Regression, no_grad since step does not block backprop and saves ocmpute time
+        with torch.no_grad():
+            lam_u = sparse_regression(
+                Phi_flat.detach(),
+                du_dt_flat.detach(),
+                threshold=self.threshold,
+                max_iter=self.max_iter,
+                alpha=self.alpha,
+            )
+            lam_v = sparse_regression(
+                Phi_flat.detach(),
+                dv_dt_flat.detach(),
+                threshold=self.threshold,
+                max_iter=self.max_iter,
+                alpha=self.alpha,
+            )
+
+        return {"Phi_flat": Phi_flat, "dudt_flat": du_dt_flat, "dvdt_flat": dv_dt_flat, "lam_u": lam_u, "lam_v": lam_v}
 
 
 class PITALoss(nn.Module):
