@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 def conv(in_planes, output_channels, kernel_size, stride, dropout_rate):
     return nn.Sequential(
         nn.Conv2d(

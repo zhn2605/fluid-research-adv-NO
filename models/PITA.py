@@ -6,6 +6,16 @@ import torch.nn.functional as F
 # loss funciton
 
 
+def relative_l2(pred_seq, true_seq, eps=1e-8):
+    B, T = pred_seq.shape[:2]
+    pred_flat = pred_seq.reshape(B, T, -1)
+    true_flat = true_seq.reshape(B, T, -1)
+    diff_norm = torch.norm(pred_flat - true_flat, p=2, dim=-1)
+    true_norm = torch.norm(true_flat, p=2, dim=-1).clamp_min(eps)
+    rel = diff_norm / true_norm
+    return rel.mean()
+
+
 def time_derivative(u, dt=1.0):
     # central difference req. both neighors
     return (u[:, 2:] - u[:, :-2]) / (2.0 * dt)
@@ -80,39 +90,65 @@ def sparse_regression(Phi, b, threshold=0.05, max_iter=10, alpha=1e-5):
     # note this isnt the entire sparse_regression, but idrk what else to call this function
     if b.dim() == 1:
         b = b.unsqueeze(-1)
-        N, M = Phi.shape
-        device, dtype = Phi.device, Phi.dtype
 
-        eye_M = torch.eye(M, device=device, dtype=dtype)
-        A_full = Phi.T @ Phi + alpha * eye_M
-        rhs_full = Phi.T @ b
-        lam = torch.linalg.solve(A_full, rhs_full)
+    _, M = Phi.shape
+    device, dtype = Phi.device, Phi.dtype
 
-        active = torch.ones(M, dtype=torch.bool, device=device)
+    eye_M = torch.eye(M, device=device, dtype=dtype)
+    A_full = Phi.T @ Phi + alpha * eye_M
+    rhs_full = Phi.T @ b
+    lam = torch.linalg.solve(A_full, rhs_full)
 
-        for _ in range(max_iter):
-            # identify currently active coefficients
-            new_active = active & (lam.squeeze(-1).abs() >= threshold)
-            if new_active.sum() == 0:
-                # nothing passed threshold
-                return torch.zeros(M, 1, device=device, dtype=dtype)
-            if bool((new_active == active).all()):
-                # active set didn't change anything
-                break
-            active = new_active
+    active = torch.ones(M, dtype=torch.bool, device=device)
 
-            # refit only using active columns / coefficients
-            Phi_Q = Phi[:, active]
-            k = Phi_Q.shape[1]
-            eye_K = torch.eye(k, device=device, dtype=dtype)
-            A_Q = Phi_Q.T @ Phi_Q + alpha * eye_K
-            rhs_Q = Phi_Q.T @ b
-            lam_Q = torch.linalg.solve(A_Q, rhs_Q)
+    for _ in range(max_iter):
+        # identify currently active coefficients
+        new_active = active & (lam.squeeze(-1).abs() >= threshold)
+        if new_active.sum() == 0:
+            # nothing passed threshold
+            return torch.zeros(M, 1, device=device, dtype=dtype)
+        if bool((new_active == active).all()):
+            # active set didn't change anything
+            break
+        active = new_active
 
-            lam = torch.zeros(M, 1, device=device, dtype=dtype)
-            lam[active] = lam_Q
+        # refit only using active columns / coefficients
+        Phi_Q = Phi[:, active]
+        k = Phi_Q.shape[1]
+        eye_K = torch.eye(k, device=device, dtype=dtype)
+        A_Q = Phi_Q.T @ Phi_Q + alpha * eye_K
+        rhs_Q = Phi_Q.T @ b
+        lam_Q = torch.linalg.solve(A_Q, rhs_Q)
 
-            return lam
+        lam = torch.zeros(M, 1, device=device, dtype=dtype)
+        lam[active] = lam_Q
+
+    return lam
+
+
+def sparse_regression_diff(Phi, b, active_mask, alpha=1e-5):
+    # active_maskl = bool tensor of shape [N_terms] that holds library columns that passed sparse regersion
+    if b.dim() == 1:
+        b = b.unsqueeze(-1)
+    _, M = Phi.shape
+    device, dtype = Phi.device, Phi.dtype
+
+    if int(active_mask.sum()) == 0:
+        return torch.zeros(M, 1, device=device, dtype=dtype)
+
+    active = active_mask.to(device=device).detach()
+    Phi_Q = Phi[:, active]
+    k = Phi_Q.shape[1]
+    eye_k = torch.eye(k, device=device, dtype=dtype)
+    A = Phi_Q.T @ Phi_Q + alpha * eye_k
+    rhs = Phi_Q.T @ b
+    lam_Q = torch.linalg.solve(A, rhs)
+
+    lam = torch.zeros(M, 1, device=device, dtype=dtype)
+    idx = torch.nonzero(active, as_tuple=False).squeeze(-1)
+    lam = lam.index_copy(0, idx, lam_Q)
+
+    return lam
 
 
 class PDEDiscovery(nn.Module):
@@ -123,11 +159,12 @@ class PDEDiscovery(nn.Module):
         self.dt = dt
         self.threshold = threshold  # beta
         self.max_iter = max_iter  # k
+        self.alpha = alpha
 
         assert downsample >= 1
         self.downsample = int(downsample)
 
-    def forward(self, seq):
+    def forward(self, seq, is_ground_truth: bool):
         # takes in sequence of tensors, builds library and runs algorithm for discoverying PDE
         s = self.downsample
 
@@ -141,43 +178,122 @@ class PDEDiscovery(nn.Module):
         u_mid = u_full[:, 1:-1]
         v_mid = v_full[:, 1:-1]
         Phi, _ = build_library(u_mid, v_mid, dx=self.dx * s, dy=self.dy * s)
+
         B, Tm, nT, h, w = Phi.shape
 
         # flatten Phi and values for sparse_regression compute compataility
-        Phi_flat = Phi.permute(0, 1, 3, 4, 2)  # 22 features (lirary terms) are sorted last
+        Phi_flat = Phi.permute(0, 1, 3, 4, 2).reshape(-1, nT)  # 22 features (lirary terms) are sorted last
         du_dt_flat = du_dt.reshape(-1, 1)
         dv_dt_flat = dv_dt.reshape(-1, 1)
 
         # Full Sparse Regression, no_grad since step does not block backprop and saves ocmpute time
         with torch.no_grad():
-            lam_u = sparse_regression(
+            lam_u_full = sparse_regression(
                 Phi_flat.detach(),
                 du_dt_flat.detach(),
                 threshold=self.threshold,
                 max_iter=self.max_iter,
                 alpha=self.alpha,
             )
-            lam_v = sparse_regression(
+            lam_v_full = sparse_regression(
                 Phi_flat.detach(),
                 dv_dt_flat.detach(),
                 threshold=self.threshold,
                 max_iter=self.max_iter,
                 alpha=self.alpha,
             )
+            active_u = (lam_u_full.squeeze(-1).abs() >= self.threshold).clone()
+            active_v = (lam_v_full.squeeze(-1).abs() >= self.threshold).clone()
 
-        return {"Phi_flat": Phi_flat, "dudt_flat": du_dt_flat, "dvdt_flat": dv_dt_flat, "lam_u": lam_u, "lam_v": lam_v}
+        if is_ground_truth:
+            # GROUNd truth is fixed target, return discovered coefficients detached
+            lam_u = lam_u_full
+            lam_v = lam_v_full
+        else:
+            # Predicted needs to be differentiable, resolved with grad enabled
+            lam_u = sparse_regression_diff(
+                Phi_flat.detach(),
+                du_dt_flat.detach(),
+                active_u,
+                alpha=self.alpha,
+            )
+            lam_v = sparse_regression_diff(
+                Phi_flat.detach(),
+                dv_dt_flat.detach(),
+                active_v,
+                alpha=self.alpha,
+            )
+
+        return {
+            "Phi_flat": Phi_flat,
+            "dudt_flat": du_dt_flat,
+            "dvdt_flat": dv_dt_flat,
+            "lam_u": lam_u,
+            "lam_v": lam_v,
+            "active_u": active_u,
+            "active_v": active_v,
+        }
 
 
 class PITALoss(nn.Module):
-    def __init__(self, dx, dy, dt, threshold, max_iter, downsample):
+    def __init__(self, dx=1.0, dy=1.0, dt=1.0, threshold=0.05, max_iter=10, alpha=1e-5, alpha_l0=1e-4, downsample=4):
         super().__init__()
         self.discovery = PDEDiscovery(
-            dx=dx, dy=dy, dt=dt, threshold=threshold, max_iter=max_iter, downsample=downsample
+            dx=dx, dy=dy, dt=dt, threshold=threshold, max_iter=max_iter, alpha=alpha, downsample=downsample
         )
-        self.L_data = nn.Parameter(torch.zeros(()))
-        self.L_phy = nn.Parameter(torch.zeros(()))
-        self.L_con = nn.Parameter(torch.zeros(()))
+        self.alpha_l0 = alpha_l0
+        self.log_sigma_data = nn.Parameter(torch.zeros(()))
+        self.log_sigma_phy = nn.Parameter(torch.zeros(()))
+        self.log_sigma_con = nn.Parameter(torch.zeros(()))
 
     def forward(self, pred_seq, true_seq):
+        # ==== Data loss ====
         # computes difference between predicted PDE and true PDE
-        L_data = F.mse_loss(pred_seq, true_seq)
+        L_data = relative_l2(pred_seq, true_seq)
+
+        # ground truth & pred PDE Discovery
+        with torch.no_grad():
+            true_disc = self.discovery(true_seq, is_ground_truth=True)
+            lam_u_true = true_disc["lam_u"]
+            lam_v_true = true_disc["lam_v"]
+
+            pred_disc = self.discovery(pred_seq, is_ground_truth=False)
+
+            Phi = pred_disc["Phi_flat"]
+            du_dt = pred_disc["dudt_flat"]
+            dv_dt = pred_disc["dvdt_flat"]
+            lam_u_pred = pred_disc["lam_u"]
+            lam_v_pred = pred_disc["lam_v"]
+
+        # ==== Physics loss ====
+        res_u = ((Phi @ lam_u_pred) - du_dt).pow(2).sum()
+        res_v = ((Phi @ lam_v_pred) - dv_dt).pow(2).sum()
+        # L0 norm = count of non-zero entries constant (active set size)
+        l0_u = pred_disc["active_u"].sum().to(Phi.dtype)
+        l0_v = pred_disc["active_v"].sum().to(Phi.dtype)
+        L_phy = res_u + res_v + self.alpha_l0 * (l0_u + l0_v)
+
+        # ==== Consistency loss ====
+        L_con = ((lam_u_true - lam_u_pred) ** 2).sum() + ((lam_v_true - lam_v_pred) ** 2).sum()
+
+        # === Unertainty-weighed total ===
+        precision_data = 0.5 * torch.exp(-2.0 * self.log_sigma_data)
+        precision_phy = 0.5 * torch.exp(-2.0 * self.log_sigma_phy)
+        precision_con = 0.5 * torch.exp(-2.0 * self.log_sigma_con)
+
+        total = (
+            precision_data * L_data
+            + precision_phy * L_phy
+            + precision_con * L_con
+            + self.log_sigma_data
+            + self.log_sigma_phy
+            + self.log_sigma_con
+        )
+
+        parts = {
+            "L_data": L_data.detach(),
+            "L_phy": L_phy.detach(),
+            "L_con": L_con.detach(),
+        }
+
+        return total, parts
