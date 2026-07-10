@@ -85,14 +85,17 @@ def build_library(u, v, dx=1.0, dy=1.0):
 
 
 def sparse_regression(Phi, b, threshold=0.05, max_iter=10, alpha=1e-5):
-    # b in this case represents target column, i.e. time derivative
-    # alpha represents regularization strength for numerical stability
-    # note this isnt the entire sparse_regression, but idrk what else to call this function
+    # Column-normalized STRidge: scale each library column to unit L2 norm
+    # before regression so the sparsity threshold is comparable across terms
+    # with wildly different magnitudes (e.g. "1" vs "u*u_x").
     if b.dim() == 1:
         b = b.unsqueeze(-1)
 
     _, M = Phi.shape
     device, dtype = Phi.device, Phi.dtype
+
+    col_norms = Phi.norm(dim=0).clamp_min(1e-12)
+    Phi = Phi / col_norms
 
     eye_M = torch.eye(M, device=device, dtype=dtype)
     A_full = Phi.T @ Phi + alpha * eye_M
@@ -123,11 +126,14 @@ def sparse_regression(Phi, b, threshold=0.05, max_iter=10, alpha=1e-5):
         lam = torch.zeros(M, 1, device=device, dtype=dtype)
         lam[active] = lam_Q
 
+    # Map coefficients back to original (unnormalized) column scale
+    lam = lam / col_norms.unsqueeze(-1)
     return lam
 
 
 def sparse_regression_diff(Phi, b, active_mask, alpha=1e-5):
-    # active_maskl = bool tensor of shape [N_terms] that holds library columns that passed sparse regersion
+    # Differentiable refit on the fixed active set, using the same column
+    # normalization scheme as sparse_regression so threshold/scale match.
     if b.dim() == 1:
         b = b.unsqueeze(-1)
     _, M = Phi.shape
@@ -138,16 +144,58 @@ def sparse_regression_diff(Phi, b, active_mask, alpha=1e-5):
 
     active = active_mask.to(device=device).detach()
     Phi_Q = Phi[:, active]
+    col_norms = Phi_Q.norm(dim=0).clamp_min(1e-12)
+    Phi_Q_n = Phi_Q / col_norms
+
     k = Phi_Q.shape[1]
     eye_k = torch.eye(k, device=device, dtype=dtype)
-    A = Phi_Q.T @ Phi_Q + alpha * eye_k
-    rhs = Phi_Q.T @ b
-    lam_Q = torch.linalg.solve(A, rhs)
+    A = Phi_Q_n.T @ Phi_Q_n + alpha * eye_k
+    rhs = Phi_Q_n.T @ b
+    lam_Q_n = torch.linalg.solve(A, rhs)
+    lam_Q = lam_Q_n / col_norms.unsqueeze(-1)
 
     lam = torch.zeros(M, 1, device=device, dtype=dtype)
     idx = torch.nonzero(active, as_tuple=False).squeeze(-1)
     lam = lam.index_copy(0, idx, lam_Q)
 
+    return lam
+
+
+def stridge_from_gram(G, c, threshold=0.05, max_iter=10, alpha=1e-5):
+    # STRidge from precomputed sufficient statistics G = Phi^T Phi (M x M) and
+    # c = Phi^T b (M x 1). Used by PITALoss.precompute_true_coefficients so we
+    # can aggregate the regression across the whole training set in one pass
+    # without holding every Phi row in memory.
+    M = G.shape[0]
+    device, dtype = G.device, G.dtype
+
+    d = G.diagonal().clamp_min(1e-24).sqrt()
+    inv_d = 1.0 / d
+    G_n = G * inv_d.unsqueeze(0) * inv_d.unsqueeze(1)
+    c_n = c * inv_d.unsqueeze(-1)
+
+    eye_M = torch.eye(M, device=device, dtype=dtype)
+    lam_n = torch.linalg.solve(G_n + alpha * eye_M, c_n)
+
+    active = torch.ones(M, dtype=torch.bool, device=device)
+    for _ in range(max_iter):
+        new_active = active & (lam_n.squeeze(-1).abs() >= threshold)
+        if new_active.sum() == 0:
+            return torch.zeros(M, 1, device=device, dtype=dtype)
+        if bool((new_active == active).all()):
+            break
+        active = new_active
+
+        G_Q = G_n[active][:, active]
+        c_Q = c_n[active]
+        k = G_Q.shape[0]
+        eye_K = torch.eye(k, device=device, dtype=dtype)
+        lam_Q_n = torch.linalg.solve(G_Q + alpha * eye_K, c_Q)
+
+        lam_n = torch.zeros(M, 1, device=device, dtype=dtype)
+        lam_n[active] = lam_Q_n
+
+    lam = lam_n * inv_d.unsqueeze(-1)
     return lam
 
 
@@ -164,10 +212,10 @@ class PDEDiscovery(nn.Module):
         assert downsample >= 1
         self.downsample = int(downsample)
 
-    def forward(self, seq, is_ground_truth: bool):
-        # takes in sequence of tensors, builds library and runs algorithm for discoverying PDE
+    def build_features(self, seq):
+        # shared between discovery.forward() and PITALoss precompute: produce
+        # flattened library and time derivatives without running regression
         s = self.downsample
-
         seq_ds = seq[..., ::s, ::s]  # stride downsample
         u_full = seq_ds[:, :, 0]
         v_full = seq_ds[:, :, 1]
@@ -180,13 +228,17 @@ class PDEDiscovery(nn.Module):
         Phi, _ = build_library(u_mid, v_mid, dx=self.dx * s, dy=self.dy * s)
 
         B, Tm, nT, h, w = Phi.shape
-
-        # flatten Phi and values for sparse_regression compute compataility
-        Phi_flat = Phi.permute(0, 1, 3, 4, 2).reshape(-1, nT)  # 22 features (lirary terms) are sorted last
+        Phi_flat = Phi.permute(0, 1, 3, 4, 2).reshape(-1, nT)
         du_dt_flat = du_dt.reshape(-1, 1)
         dv_dt_flat = dv_dt.reshape(-1, 1)
+        return Phi_flat, du_dt_flat, dv_dt_flat
 
-        # Full Sparse Regression, no_grad since step does not block backprop and saves ocmpute time
+    def forward(self, seq, is_ground_truth: bool):
+        # takes in sequence of tensors, builds library and runs algorithm for discoverying PDE
+        Phi_flat, du_dt_flat, dv_dt_flat = self.build_features(seq)
+
+        # Full Sparse Regression, no_grad since active-set selection does not
+        # need gradient and saves compute time
         with torch.no_grad():
             lam_u_full = sparse_regression(
                 Phi_flat.detach(),
@@ -212,14 +264,14 @@ class PDEDiscovery(nn.Module):
         else:
             # Predicted needs to be differentiable, resolved with grad enabled
             lam_u = sparse_regression_diff(
-                Phi_flat.detach(),
-                du_dt_flat.detach(),
+                Phi_flat,
+                du_dt_flat,
                 active_u,
                 alpha=self.alpha,
             )
             lam_v = sparse_regression_diff(
-                Phi_flat.detach(),
-                dv_dt_flat.detach(),
+                Phi_flat,
+                dv_dt_flat,
                 active_v,
                 alpha=self.alpha,
             )
@@ -246,35 +298,84 @@ class PITALoss(nn.Module):
         self.log_sigma_phy = nn.Parameter(torch.zeros(()))
         self.log_sigma_con = nn.Parameter(torch.zeros(()))
 
+        # Buffers populated by precompute_true_coefficients(); the consistency
+        # loss target must be a single fixed Λ_true for the whole training set,
+        # not a per-batch re-discovery of it (which would jitter every step).
+        self.register_buffer("lam_u_true", torch.empty(0))
+        self.register_buffer("lam_v_true", torch.empty(0))
+
+    @torch.no_grad()
+    def precompute_true_coefficients(self, dataloader, target_key="targets"):
+        # Aggregate Phi^T Phi and Phi^T b across the entire training set, then
+        # run STRidge once to get a fixed (Λ_u_true, Λ_v_true). Must be called
+        # before the first forward() pass.
+        device = self.log_sigma_data.device
+        G = c_u = c_v = None
+        M = None
+        dtype = None
+
+        for batch in dataloader:
+            true_seq = batch[target_key].to(device)
+            Phi_flat, du_dt_flat, dv_dt_flat = self.discovery.build_features(true_seq)
+            if G is None:
+                M = Phi_flat.shape[1]
+                dtype = Phi_flat.dtype
+                G = torch.zeros(M, M, device=device, dtype=dtype)
+                c_u = torch.zeros(M, 1, device=device, dtype=dtype)
+                c_v = torch.zeros(M, 1, device=device, dtype=dtype)
+            G = G + Phi_flat.T @ Phi_flat
+            c_u = c_u + Phi_flat.T @ du_dt_flat
+            c_v = c_v + Phi_flat.T @ dv_dt_flat
+
+        if G is None:
+            raise RuntimeError("precompute_true_coefficients: dataloader was empty")
+
+        lam_u = stridge_from_gram(
+            G, c_u,
+            threshold=self.discovery.threshold,
+            max_iter=self.discovery.max_iter,
+            alpha=self.discovery.alpha,
+        )
+        lam_v = stridge_from_gram(
+            G, c_v,
+            threshold=self.discovery.threshold,
+            max_iter=self.discovery.max_iter,
+            alpha=self.discovery.alpha,
+        )
+        self.lam_u_true = lam_u
+        self.lam_v_true = lam_v
+
     def forward(self, pred_seq, true_seq):
+        if self.lam_u_true.numel() == 0:
+            raise RuntimeError(
+                "PITALoss.lam_u_true is empty; call precompute_true_coefficients(train_loader) once before training."
+            )
+
         # ==== Data loss ====
-        # computes difference between predicted PDE and true PDE
+        # relative L2 between predicted and true rollouts
         L_data = relative_l2(pred_seq, true_seq)
 
-        # ground truth & pred PDE Discovery
-        with torch.no_grad():
-            true_disc = self.discovery(true_seq, is_ground_truth=True)
-            lam_u_true = true_disc["lam_u"]
-            lam_v_true = true_disc["lam_v"]
+        # Predicted-trajectory PDE discovery (must be differentiable wrt model)
+        pred_disc = self.discovery(pred_seq, is_ground_truth=False)
 
-            pred_disc = self.discovery(pred_seq, is_ground_truth=False)
-
-            Phi = pred_disc["Phi_flat"]
-            du_dt = pred_disc["dudt_flat"]
-            dv_dt = pred_disc["dvdt_flat"]
-            lam_u_pred = pred_disc["lam_u"]
-            lam_v_pred = pred_disc["lam_v"]
+        Phi = pred_disc["Phi_flat"]
+        du_dt = pred_disc["dudt_flat"]
+        dv_dt = pred_disc["dvdt_flat"]
+        lam_u_pred = pred_disc["lam_u"]
+        lam_v_pred = pred_disc["lam_v"]
 
         # ==== Physics loss ====
-        res_u = ((Phi @ lam_u_pred) - du_dt).pow(2).sum()
-        res_v = ((Phi @ lam_v_pred) - dv_dt).pow(2).sum()
-        # L0 norm = count of non-zero entries constant (active set size)
+        # mean-reduced so it lives on O(1) scale alongside L_data; sum-reduced
+        # was ~1e3 and drowned out the data and consistency terms
+        res_u = ((Phi @ lam_u_pred) - du_dt).pow(2).mean()
+        res_v = ((Phi @ lam_v_pred) - dv_dt).pow(2).mean()
         l0_u = pred_disc["active_u"].sum().to(Phi.dtype)
         l0_v = pred_disc["active_v"].sum().to(Phi.dtype)
         L_phy = res_u + res_v + self.alpha_l0 * (l0_u + l0_v)
 
         # ==== Consistency loss ====
-        L_con = ((lam_u_true - lam_u_pred) ** 2).sum() + ((lam_v_true - lam_v_pred) ** 2).sum()
+        # pred coeffs vs precomputed fixed-target coeffs (mean reduction)
+        L_con = ((self.lam_u_true - lam_u_pred) ** 2).mean() + ((self.lam_v_true - lam_v_pred) ** 2).mean()
 
         # === Unertainty-weighed total ===
         precision_data = 0.5 * torch.exp(-2.0 * self.log_sigma_data)
