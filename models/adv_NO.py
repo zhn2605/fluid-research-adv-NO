@@ -2,18 +2,26 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+def conv(input, output, kern, stride, padding):
+    return nn.Sequential(
+        nn.utils.spectral_norm(nn.Conv2d(in_channels=input, out_channels=output, kernel_size=kern, stride=stride, padding=padding)),
+        nn.LeakyReLU(0.2, inplace=True)
+    )
+
 class Discriminator(nn.Module):
     # PatchGAN-style critic: velocity field [B, 2, H, W] -> grid of realness
     # logits. Judges local patches, so it pressures the small-scale structure
     # that L1/L2 ignores.
 
-    def __init__(self, input_channels: int = 2, base_width: int = 64):
+    def __init__(self, input_channels=2, output_channels=2, kernel_size=4, stride=2, padding=1, base_width=64):
         super().__init__()
-        # 
+        self.conv1 = conv(input_channels, base_width, kern=kernel_size, stride=stride, padding=padding)
+        self.conv2 = conv(64, 128, kern=kernel_size, stride=stride, padding=padding)
+        self.conv3 = conv(128, 256, kern=kernel_size, stride=stride, padding=padding)
 
+    
     def forward(self, x):
-        # returns patch logits [B, 1, h', w']
-        raise NotImplementedError
+
 
 
 class AdvNOLoss(nn.Module):
