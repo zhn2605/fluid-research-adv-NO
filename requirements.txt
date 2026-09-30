@@ -1,0 +1,10 @@
+torch==2.13.0
+torchvision==0.28.0
+numpy==2.5.2
+h5py==3.16.0
+matplotlib==3.11.1
+scipy==1.18.0
+jupyterlab==4.6.3
+ipykernel==7.3.0
+torchinfo==1.8.0
+notebook==7.6.2
