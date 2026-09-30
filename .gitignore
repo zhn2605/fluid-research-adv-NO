@@ -2,3 +2,5 @@
 *.venv/*
 *.config/*
 UNet\ Output/*
+outputs/
+__pycache__/
