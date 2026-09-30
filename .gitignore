@@ -1,0 +1,6 @@
+*.data/*
+*.venv/*
+*.config/*
+UNet\ Output/*
+outputs/
+models/__pycache__
