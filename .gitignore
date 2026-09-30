@@ -3,4 +3,4 @@
 *.config/*
 UNet\ Output/*
 outputs/
-__pycache__/
+models/__pycache__
