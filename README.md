@@ -1,6 +1,6 @@
 # fluid-research-adv-NO
 
-Fluid prediction using adversarial neural operators. A UNet is trained on PIV
+Extending flow forecasting research with adverserial neural operators and physics-informed time adverserial methods. A UNet is trained on PIV
 velocity data three ways and compared:
 
 - baseline (MSE loss)
@@ -40,6 +40,5 @@ filename.
 ## adv-NO memory
 
 `adv_max_frames` limits how many frames the discriminator and VGG see per step.
-At batch 32 on 8 GB, 16 frames peaked at ~5.1 GB and 32+ ran out of memory. If
-you run out of memory, lower `batch_size` first. The runs used for the poster
-all used batch size 16.
+At batch 32 on 8 GB, 16 frames peaked at ~5.1 GB and 32+ ran out of memory.
+If you encounter OOM, lower `batch_size` first. Poster figures are all generated from batch size = 16 runs.
